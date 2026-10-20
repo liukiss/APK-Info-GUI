@@ -1,0 +1,76 @@
+[workspace.package]
+version = "1.0.13"
+authors = ["Alexey <delvinru@gmail.com>"]
+description = "Fast, malware-robust parser for Android APK/XAPK/APKM files"
+edition = "2024"
+keywords = ["android", "apk", "arsc", "axml", "malware"]
+license = "Apache-2.0"
+readme = "README.md"
+rust-version = "1.93.0"
+repository = "https://github.com/delvinru/apk-info"
+
+[workspace]
+resolver = "3"
+members = [
+    "cli",
+    "core",
+    "crates/axml",
+    "crates/xml",
+    "crates/zip",
+    "gui",
+    "fuzz",
+    "python",
+]
+
+[workspace.dependencies]
+# internal
+apk-info = { path = "core", version = "1.0.13" }
+apk-info-axml = { path = "crates/axml", version = "1.0.13" }
+apk-info-xml = { path = "crates/xml", version = "1.0.13" }
+apk-info-zip = { path = "crates/zip", version = "1.0.13" }
+
+# external
+anyhow = "1.0.104"
+ahash = "0.8.12"
+bat = { version = "0.26.1", default-features = false, features = [
+    "build-assets",
+    "regex-fancy",
+] }
+bitflags = "2.13.1"
+clap = { version = "4.6.6", features = ["derive"] }
+clap_complete = "4.6.9"
+cms = "0.3.0-pre.2"
+colored = "3.1.1"
+crc32fast = "1.5.0"
+env_logger = { version = "0.11.11", features = ["auto-color"] }
+flate2 = "1.1.9"
+log = "0.4.33"
+md-5 = "0.11.0"
+memchr = "2.8.3"
+mimalloc = "0.1"
+phf = { version = "0.14.0", default-features = false }
+phf_codegen = "0.14.0"
+pyo3 = "0.29.2"
+quick-xml = "0.42.0"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+thiserror = "2"
+walkdir = "2.5.0"
+winnow = { version = "1.0.4", features = ["binary"] }
+x509-cert = "0.3.0"
+
+[profile.release]
+codegen-units = 1
+panic = "abort"
+
+# longer build, but smaller binary and better optimized
+[profile.release-lto]
+inherits = "release"
+lto = true
+
+[profile.profiling]
+inherits = "release"
+debug = true

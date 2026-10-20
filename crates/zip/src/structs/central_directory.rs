@@ -1,0 +1,313 @@
+use std::sync::Arc;
+
+use ahash::AHashMap;
+use winnow::binary::{le_u16, le_u32};
+use winnow::combinator::repeat;
+use winnow::error::{ErrMode, Needed, ParserError};
+use winnow::prelude::*;
+use winnow::token::take;
+
+#[derive(Debug)]
+pub(crate) struct CentralDirectoryEntry {
+    #[allow(unused)]
+    pub(crate) version_made_by: u16,
+
+    #[allow(unused)]
+    pub(crate) version_needed: u16,
+
+    #[allow(unused)]
+    pub(crate) general_purpose: u16,
+
+    #[allow(unused)]
+    pub(crate) compression_method: u16,
+
+    #[allow(unused)]
+    pub(crate) last_mod_time: u16,
+
+    #[allow(unused)]
+    pub(crate) last_mod_date: u16,
+
+    #[allow(unused)]
+    pub(crate) crc32: u32,
+
+    pub(crate) compressed_size: u32,
+
+    pub(crate) uncompressed_size: u32,
+
+    #[allow(unused)]
+    pub(crate) file_name_length: u16,
+
+    #[allow(unused)]
+    pub(crate) extra_field_length: u16,
+
+    #[allow(unused)]
+    pub(crate) file_comment_length: u16,
+
+    #[allow(unused)]
+    pub(crate) disk_number_start: u16,
+
+    #[allow(unused)]
+    pub(crate) internal_attrs: u16,
+
+    #[allow(unused)]
+    pub(crate) external_attrs: u32,
+
+    pub(crate) local_header_offset: u32,
+
+    pub(crate) file_name: Arc<str>,
+
+    #[allow(unused)]
+    pub(crate) extra_field: Arc<[u8]>,
+
+    #[allow(unused)]
+    pub(crate) file_comment: Arc<[u8]>,
+}
+
+impl CentralDirectoryEntry {
+    const MAGIC: u32 = 0x02014b50;
+
+    #[inline(always)]
+    fn parse(input: &mut &[u8]) -> ModalResult<CentralDirectoryEntry> {
+        let (
+            _,
+            version_made_by,
+            version_needed,
+            general_purpose,
+            compression_method,
+            last_mod_time,
+            last_mod_date,
+            crc32,
+            compressed_size,
+            uncompressed_size,
+        ) = (
+            le_u32.verify(|magic| *magic == Self::MAGIC), // magic
+            le_u16,                                       // version_made_by
+            le_u16,                                       // version_needed
+            le_u16,                                       // general_purpose
+            le_u16,                                       // compression_method
+            le_u16,                                       // last_mod_time
+            le_u16,                                       // last_mod_date
+            le_u32,                                       // crc32
+            le_u32,                                       // compressed_size
+            le_u32,                                       // uncompressed_size
+        )
+            .parse_next(input)?;
+
+        let (
+            file_name_length,
+            extra_field_length,
+            file_comment_length,
+            disk_number_start,
+            internal_attrs,
+            external_attrs,
+            local_header_offset,
+        ) = (
+            le_u16, // file_name_length
+            le_u16, // extra_field_length
+            le_u16, // file_comment_length
+            le_u16, // disk_number_start
+            le_u16, // internal_attrs
+            le_u32, // external_attrs
+            le_u32, // local_header_offset
+        )
+            .parse_next(input)?;
+
+        let (file_name, extra_field, file_comment) = (
+            take(file_name_length),
+            take(extra_field_length),
+            take(file_comment_length),
+        )
+            .parse_next(input)?;
+
+        let file_name = std::str::from_utf8(file_name).map_err(|_| ErrMode::from_input(input))?;
+
+        Ok(CentralDirectoryEntry {
+            version_made_by,
+            version_needed,
+            general_purpose,
+            compression_method,
+            last_mod_time,
+            last_mod_date,
+            crc32,
+            compressed_size,
+            uncompressed_size,
+            file_name_length,
+            extra_field_length,
+            file_comment_length,
+            disk_number_start,
+            internal_attrs,
+            external_attrs,
+            local_header_offset,
+            file_name: Arc::from(file_name),
+            extra_field: Arc::from(extra_field),
+            file_comment: Arc::from(file_comment),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CentralDirectory {
+    pub(crate) entries: AHashMap<Arc<str>, CentralDirectoryEntry>,
+
+    /// Entry names in central directory record order (first occurrence wins).
+    ///
+    /// Iteration over the hash map is random per process; extraction and repack
+    /// follow the file's own order instead, so it is preserved here.
+    pub(crate) ordered_names: Vec<Arc<str>>,
+}
+
+impl CentralDirectory {
+    pub(crate) fn parse(input: &[u8], cd_offset: usize) -> ModalResult<CentralDirectory> {
+        let mut input = input
+            .get(cd_offset..)
+            .ok_or(ErrMode::Incomplete(Needed::Unknown))?;
+
+        let parsed = repeat::<_, CentralDirectoryEntry, Vec<CentralDirectoryEntry>, _, _>(
+            0..,
+            CentralDirectoryEntry::parse,
+        )
+        .parse_next(&mut input)?;
+
+        // `read` looks names up in the map, so a duplicated name keeps the last
+        // record's data; `ordered_names` keeps the first record's position.
+        let mut entries = AHashMap::with_capacity(parsed.len());
+        let mut ordered_names = Vec::with_capacity(parsed.len());
+        for entry in parsed {
+            let name = Arc::clone(&entry.file_name);
+            if entries
+                .insert(Arc::clone(&entry.file_name), entry)
+                .is_none()
+            {
+                ordered_names.push(name);
+            }
+        }
+
+        Ok(CentralDirectory {
+            entries,
+            ordered_names,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_cde_record(
+        file_name: &str,
+        extra_field: &[u8],
+        comment: &[u8],
+        compressed_size: u32,
+        uncompressed_size: u32,
+        local_header_offset: u32,
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+
+        data.extend_from_slice(&CentralDirectoryEntry::MAGIC.to_le_bytes()); // magic
+        data.extend_from_slice(&45u16.to_le_bytes()); // version_made_by
+        data.extend_from_slice(&20u16.to_le_bytes()); // version_needed
+        data.extend_from_slice(&0u16.to_le_bytes()); // general_purpose
+        data.extend_from_slice(&8u16.to_le_bytes()); // compression_method
+        data.extend_from_slice(&1234u16.to_le_bytes()); // last_mod_time
+        data.extend_from_slice(&5678u16.to_le_bytes()); // last_mod_date
+        data.extend_from_slice(&0xAABBCCDDu32.to_le_bytes()); // crc32
+        data.extend_from_slice(&compressed_size.to_le_bytes());
+        data.extend_from_slice(&uncompressed_size.to_le_bytes());
+        data.extend_from_slice(&(file_name.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(extra_field.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes()); // disk_number_start
+        data.extend_from_slice(&0u16.to_le_bytes()); // internal_attrs
+        data.extend_from_slice(&0x11223344u32.to_le_bytes()); // external_attrs
+        data.extend_from_slice(&local_header_offset.to_le_bytes());
+
+        data.extend_from_slice(file_name.as_bytes()); // file_name
+        data.extend_from_slice(extra_field); // extra_field
+        data.extend_from_slice(comment); // comment
+        data
+    }
+
+    #[test]
+    fn test_parse_valid_cde_entry() {
+        let file_name = "hello.txt";
+        let extra = b"extra field";
+        let comment = b"comment field";
+        let data = make_cde_record(file_name, extra, comment, 111, 222, 333);
+
+        let mut input = &data[..];
+        let entry = CentralDirectoryEntry::parse(&mut input).unwrap();
+
+        assert_eq!(entry.file_name.as_ref(), file_name);
+        assert_eq!(entry.extra_field.as_ref(), extra);
+        assert_eq!(entry.file_comment.as_ref(), comment);
+        assert_eq!(entry.compressed_size, 111);
+        assert_eq!(entry.uncompressed_size, 222);
+        assert_eq!(entry.local_header_offset, 333);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn test_parse_invalid_magic() {
+        let mut data = make_cde_record("x", &[], &[], 1, 2, 3);
+        data[0] = 0x00; // corrupt magic
+        let mut input = &data[..];
+        let result = CentralDirectoryEntry::parse(&mut input);
+        assert!(result.is_err(), "expected error on invalid magic");
+    }
+
+    #[test]
+    fn test_parse_non_utf8_filename() {
+        // Filename bytes that are invalid UTF-8
+        let bad_bytes = [0xFF, 0xFE, 0xFD];
+        let mut data = make_cde_record("", &[], &[], 0, 0, 0);
+        let name_len = bad_bytes.len() as u16;
+
+        // Patch in new filename length and name
+        data[28..30].copy_from_slice(&name_len.to_le_bytes());
+        data.extend_from_slice(&bad_bytes);
+
+        let mut input = &data[..];
+        let entry = CentralDirectoryEntry::parse(&mut input);
+
+        assert!(entry.is_err());
+    }
+
+    #[test]
+    fn test_parse_multiple_entries_in_directory() {
+        // Two entries back-to-back
+        let e1 = make_cde_record("a.txt", b"", b"", 10, 20, 30);
+        let e2 = make_cde_record("b.txt", b"extra information", b"comment field", 40, 50, 60);
+        let mut data = Vec::new();
+        data.extend_from_slice(&e1);
+        data.extend_from_slice(&e2);
+
+        let cd = CentralDirectory::parse(&data, 0).unwrap();
+        assert_eq!(cd.entries.len(), 2);
+        assert!(cd.entries.contains_key("a.txt"));
+        assert!(cd.entries.contains_key("b.txt"));
+
+        let b = cd.entries.get("b.txt").unwrap();
+        assert_eq!(b.extra_field.as_ref(), b"extra information");
+        assert_eq!(b.file_comment.as_ref(), b"comment field");
+    }
+
+    #[test]
+    fn test_parse_central_directory_with_offset() {
+        let entry = make_cde_record("offset.txt", b"", b"", 100, 200, 300);
+        let mut file = vec![0xAA; 50]; // padding before
+        let offset = file.len();
+        file.extend_from_slice(&entry);
+
+        let cd = CentralDirectory::parse(&file, offset).unwrap();
+        assert_eq!(cd.entries.len(), 1);
+        assert!(cd.entries.contains_key("offset.txt"));
+    }
+
+    #[test]
+    fn test_parse_central_directory_invalid_offset() {
+        let data = vec![0x00; 10];
+
+        let result = CentralDirectory::parse(&data, 9999);
+        assert!(result.is_err(), "expected error for out-of-bounds offset");
+    }
+}

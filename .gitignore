@@ -1,0 +1,34 @@
+# Rust
+/target
+rustc-ice-*.txt
+
+# CodeGraph index
+.codegraph/
+
+# Python (bindings + tests)
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.so
+.venv/
+dist/
+*.egg-info/
+.coverage
+
+# mkdocs
+site/
+docs/_build/
+
+# Editor
+.idea/
+.vscode/
+
+# direnv / nix
+.direnv/*
+.python-version
+
+# custom check scripts
+checks/
+
+# macOS
+.DS_Store

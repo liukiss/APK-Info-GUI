@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+
+  publish-pypi:
+    name: Release (pypi)
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+    environment:
+      name: pypi
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: "wheels-*"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: "wheels-*/*"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Publish to PyPI
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish wheels-*/*
+
+  publish-crate:
+    name: Release (crates.io)
+    needs: [build]
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: crates
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      - name: Publish crate
+        run: |
+          cargo login ${{ secrets.CRATES_API_TOKEN }}
+          cargo publish -p apk-info-zip
+          cargo publish -p apk-info-xml
+          cargo publish -p apk-info-axml
+          cargo publish -p apk-info
+          cargo publish -p apk-info-cli
+
+  publish-github:
+    name: Release (github)
+    needs: [build]
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: apk-info*
+
+      - name: Generating release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          files: apk-info*/apk-info*

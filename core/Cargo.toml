@@ -1,0 +1,20 @@
+[package]
+name = "apk-info"
+authors.workspace = true
+categories = ["parser-implementations", "os::android-apis"]
+description.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+apk-info-axml.workspace = true
+apk-info-xml.workspace = true
+apk-info-zip.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

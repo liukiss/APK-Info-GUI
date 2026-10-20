@@ -1,0 +1,23 @@
+[package]
+name = "apk-info-gui"
+version = "1.0.13"
+description = "apk-info Windows 图形版（免安装）"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "apk-info-gui"
+path = "src/main.rs"
+
+[dependencies]
+apk-info-cli = { path = "../cli" }
+anyhow.workspace = true
+clap = { workspace = true }
+clap_complete = { workspace = true }
+eframe = "0.29"
+rfd = "0.15"
+serde_json.workspace = true

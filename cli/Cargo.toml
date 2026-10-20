@@ -1,0 +1,40 @@
+[package]
+name = "apk-info-cli"
+description = "A command-line tool to inspect and extract APK files"
+authors.workspace = true
+categories = ["command-line-utilities", "os::android-apis"]
+edition.workspace = true
+keywords = ["android", "apk", "malware", "cli", "analysis"]
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+apk-info-axml.workspace = true
+apk-info-xml.workspace = true
+apk-info-zip.workspace = true
+apk-info.workspace = true
+bat.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+colored.workspace = true
+env_logger.workspace = true
+log.workspace = true
+md-5.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true
+mimalloc.workspace = true
+
+[[bin]]
+name = "apk-info"
+path = "src/main.rs"
+doc = false
+
+[lib]
+name = "apk_info_cli"
+path = "src/lib.rs"

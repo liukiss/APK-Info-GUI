@@ -1,0 +1,1107 @@
+//! The main structure that represents the `apk` file.
+
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{self, Cursor};
+use std::path::Path;
+use std::sync::OnceLock;
+
+use apk_info_axml::{ARSC, AXML};
+use apk_info_xml::Element;
+use apk_info_zip::{FileCompressionType, Signature, ZipEntry, ZipError};
+
+use crate::errors::APKError;
+use crate::models::{
+    Activity, ActivityAlias, Attribution, IntentFilter, Permission, Provider, Receiver, Service,
+    XAPKManifest,
+};
+
+/// The name of the manifest to be searched for in the zip archive.
+const ANDROID_MANIFEST_PATH: &str = "AndroidManifest.xml";
+
+/// The name of the manifest to be searched for in the XAPK format.
+const XAPK_MANIFEST_PATH: &str = "manifest.json";
+
+/// The name of the base.apk to be searched for in the APKM format.
+const APKM_BASE_APK: &str = "base.apk";
+
+/// The name of the resource to be searched in the zip archive.
+const RESOURCE_TABLE_PATH: &str = "resources.arsc";
+
+/// The main structure that represents the `apk` file.
+///
+/// Reads lazily: only the manifest, the resource table and the entries
+/// actually requested are decompressed into memory.
+#[derive(Debug)]
+pub struct Apk {
+    zip: ZipEntry,
+    axml: AXML,
+    arsc: Option<ARSC>,
+
+    /// The name of the app entry inside a `xapk`/`apkm` container.
+    base_apk_name: Option<String>,
+
+    /// Cache of the parsed inner `base.apk` of a `xapk`/`apkm` container,
+    /// seeded during [`Apk::new`] so queries never re-decompress it.
+    /// Outer `None`: not a container. Inner `None`: the inner apk failed
+    /// to parse.
+    inner_zip: OnceLock<Option<ZipEntry>>,
+}
+
+/// Everything [`Apk::init`] gathers from a file.
+struct ParsedApk {
+    zip: ZipEntry,
+    base_apk_name: Option<String>,
+    axml: AXML,
+    arsc: Option<ARSC>,
+    inner_zip: OnceLock<Option<ZipEntry>>,
+}
+
+/// Implementation of internal methods
+impl Apk {
+    fn get_arsc(zip: &ZipEntry) -> Result<Option<ARSC>, APKError> {
+        match zip.read(RESOURCE_TABLE_PATH) {
+            // A present-but-corrupt `resources.arsc` is a known static-analysis
+            // evasion trick. The table is only needed to resolve reference-typed
+            // values, so a parse failure is treated the same as a missing table
+            // (`None`) rather than rejecting the whole APK — the manifest, DEX
+            // and signatures can still be analyzed. This matches how androguard
+            // and apkInspector ignore a broken resource table.
+            Ok((data, _)) => Ok(ARSC::new(&mut &data[..]).ok()),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn get_axml(manifest: &[u8], arsc: Option<&ARSC>) -> Result<AXML, APKError> {
+        if manifest.is_empty() {
+            return Err(APKError::InvalidInput("AndroidManifest.xml is empty"));
+        }
+
+        AXML::new(&mut &manifest[..], arsc).map_err(APKError::ManifestError)
+    }
+
+    /// Helper function for reading apk files
+    fn init(p: &Path) -> Result<ParsedApk, APKError> {
+        let file = File::open(p).map_err(APKError::IoError)?;
+        if file.metadata().map_err(APKError::IoError)?.len() == 0 {
+            return Err(APKError::InvalidInput("got empty file"));
+        }
+
+        // only the central directory is loaded now; the manifest, resource
+        // table and requested entries follow on demand
+        let zip = ZipEntry::from_reader(file).map_err(APKError::ZipError)?;
+
+        // apk
+        if let Ok((manifest, _)) = zip.read(ANDROID_MANIFEST_PATH) {
+            let arsc = Self::get_arsc(&zip)?;
+            let axml = Self::get_axml(&manifest, arsc.as_ref())?;
+
+            return Ok(ParsedApk {
+                zip,
+                base_apk_name: None,
+                axml,
+                arsc,
+                inner_zip: OnceLock::new(),
+            });
+        }
+
+        // helper to parse an inner apk out of the container and seed its cache
+        let parse_inner = |data: Vec<u8>| -> Result<(AXML, Option<ARSC>, ZipEntry), APKError> {
+            let inner_apk = ZipEntry::from_reader(Cursor::new(data)).map_err(APKError::ZipError)?;
+            let (inner_manifest, _) = inner_apk
+                .read(ANDROID_MANIFEST_PATH)
+                .map_err(APKError::ZipError)?;
+
+            let arsc = Self::get_arsc(&inner_apk)?;
+            let axml = Self::get_axml(&inner_manifest, arsc.as_ref())?;
+
+            Ok((axml, arsc, inner_apk))
+        };
+
+        // xapk
+        if let Ok((manifest_json_data, _)) = zip.read(XAPK_MANIFEST_PATH) {
+            let manifest_json: XAPKManifest =
+                serde_json::from_slice(&manifest_json_data).map_err(APKError::XAPKManifestError)?;
+
+            let package_name = format!("{}.apk", manifest_json.package_name);
+            let (inner_apk_data, _) = zip.read(&package_name).map_err(APKError::ZipError)?;
+            let (axml, arsc, inner_apk) = parse_inner(inner_apk_data)?;
+
+            // the apk is parsed already; keeping it makes later queries free
+            let inner_zip = OnceLock::new();
+            inner_zip.get_or_init(|| Some(inner_apk));
+
+            return Ok(ParsedApk {
+                zip,
+                base_apk_name: Some(package_name),
+                axml,
+                arsc,
+                inner_zip,
+            });
+        }
+
+        // apkm
+        if let Ok((inner_apk_data, _)) = zip.read(APKM_BASE_APK) {
+            let (axml, arsc, inner_apk) = parse_inner(inner_apk_data)?;
+
+            let inner_zip = OnceLock::new();
+            inner_zip.get_or_init(|| Some(inner_apk));
+
+            return Ok(ParsedApk {
+                zip,
+                base_apk_name: Some(APKM_BASE_APK.to_owned()),
+                axml,
+                arsc,
+                inner_zip,
+            });
+        }
+
+        Err(APKError::InvalidInput("is it apk/xapk/apkm?"))
+    }
+
+    /// Checks if a zip entry name matches an Android `classes*.dex` file, i.e. `classes.dex`,
+    fn is_dex_name(name: &str) -> bool {
+        name.strip_prefix("classes")
+            .and_then(|rest| rest.strip_suffix(".dex"))
+            .is_some_and(|middle| middle.is_empty() || middle.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    /// Extracts the ABI from a split apk file name inside a `xapk`/`apkm` container.
+    fn split_abi_from_name(name: &str) -> Option<String> {
+        let token = name
+            .strip_prefix("config.")
+            .or_else(|| name.strip_prefix("split_config."))?
+            .strip_suffix(".apk")?;
+
+        let abi = token.replace('_', "-");
+
+        Self::is_known_abi(&abi).then_some(abi)
+    }
+
+    /// Checks whether a string is a well-known Android ABI.
+    #[inline]
+    fn is_known_abi(abi: &str) -> bool {
+        matches!(
+            abi,
+            "arm64-v8a"
+                | "armeabi"
+                | "armeabi-v7a"
+                | "mips"
+                | "mips64"
+                | "riscv64"
+                | "x86"
+                | "x86_64"
+        )
+    }
+}
+
+impl Apk {
+    /// Creates a new [Apk] object.
+    ///
+    /// Upon initialization, the apk file will be read and analyzed.
+    ///
+    /// ```ignore
+    /// let apk = Apk::new("./file.apk").expect("can't analyze apk file");
+    /// ```
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Apk, APKError> {
+        let path = path.as_ref();
+
+        // basic sanity check
+        if !path.exists() {
+            return Err(APKError::IoError(io::Error::new(
+                io::ErrorKind::NotFound,
+                "file not found",
+            )));
+        }
+
+        let parsed = Self::init(path)?;
+
+        Ok(Apk {
+            zip: parsed.zip,
+            axml: parsed.axml,
+            arsc: parsed.arsc,
+            base_apk_name: parsed.base_apk_name,
+            inner_zip: parsed.inner_zip,
+        })
+    }
+
+    /// Reads data from `apk` file.
+    ///
+    /// ```ignore
+    /// let apk = Apk::new("./file.apk").expect("can't analyze apk file");
+    /// let (data, compression_method) = apk.read("classes.dex").expect("can't read file");
+    /// ```
+    #[inline]
+    pub fn read(&self, filename: &str) -> Result<(Vec<u8>, FileCompressionType), ZipError> {
+        self.zip.read(filename)
+    }
+
+    /// Retrieves the list of files that are specified in the central directory (zip).
+    ///
+    /// ```ignore
+    /// let apk = Apk::new("./file.apk").expect("can't analyze apk file");
+    /// for file in apk.namelist() {
+    ///     println!("{}", file);
+    /// }
+    /// ```
+    #[inline]
+    pub fn namelist(&self) -> impl Iterator<Item = &str> + '_ {
+        self.zip.namelist()
+    }
+
+    /// Converts the internal xml representation of the `AndroidManifest.xml` to a human readable format.
+    #[inline]
+    pub fn get_xml_string(&self) -> String {
+        self.axml.get_xml_string()
+    }
+
+    /// Checks if the APK has multiple `classes.dex` files or not.
+    pub fn is_multidex(&self) -> bool {
+        let entries = match self.base_apk_name.as_deref() {
+            // regular apk
+            None => &self.zip,
+            // split container (xapk/apkm): the inner apk is cached, no re-reading
+            Some(_) => match self.get_inner_zip() {
+                Ok(inner) => inner,
+                Err(_) => return false,
+            },
+        };
+
+        entries
+            .namelist()
+            .filter(|name| Self::is_dex_name(name))
+            .count()
+            > 1
+    }
+
+    /// An auxiliary method that allows you to get a value from a reference to a resource.
+    ///
+    /// It can be a string, a file path, etc., depending on the context in which this function is used.
+    ///
+    /// ```ignore
+    /// let apk = Apk::new("./file.apk").expect("can't analyze apk file");
+    /// let app_name = apk.get_resource_value("@string/app_name");
+    /// ```
+    pub fn get_resource_value(&self, name: &str) -> Option<String> {
+        // if not a reference name - return nothing
+        if !name.starts_with('@') {
+            return None;
+        }
+
+        if let Some(arsc) = &self.arsc {
+            // safe slice, checked before
+            let name = &name[1..];
+            return arsc.get_resource_value_by_name(name);
+        }
+
+        None
+    }
+
+    /// An auxiliary method that allows you to get the attribute value directly from `AndroidManifest.xml`.
+    ///
+    /// If the value is a link to a resource, it will be automatically resolved to the file name.
+    ///
+    /// Example of how to get additional information from the `<application>` tag:
+    ///
+    /// ```ignore
+    /// let apk = Apk::new("./file.apk").expect("can't analyze apk file");
+    /// apk.get_attribute_value("application", "allowClearUserData")
+    /// ```
+    #[inline]
+    pub fn get_attribute_value(&self, tag: &str, name: &str) -> Option<String> {
+        self.axml.get_attribute_value(tag, name, self.arsc.as_ref())
+    }
+
+    /// An auxiliary method that allows you to get the value from all attributes from `AndroidManifest.xml`.
+    #[inline]
+    pub fn get_all_attribute_values<'a>(
+        &'a self,
+        tag: &'a str,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a str> {
+        self.axml.get_all_attribute_values(tag, name)
+    }
+
+    /// Retrieves the package name declared in the `<manifest>` element.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/manifest-element#package>
+    #[inline]
+    pub fn get_package_name(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "package", self.arsc.as_ref())
+    }
+
+    /// Retrieves the `sharedUserId` attribute from the `<manifest>` element.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/manifest-element#uid>
+    #[inline]
+    pub fn get_shared_user_id(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "sharedUserId", self.arsc.as_ref())
+    }
+
+    /// Retrieves the `sharedUserLabel` attribute from the `<manifest>` element.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/manifest-element#uidlabel>
+    #[inline]
+    pub fn get_shared_user_label(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "sharedUserLabel", self.arsc.as_ref())
+    }
+
+    /// Retrieves the `sharedUserMaxSdkVersion` attribute from the `<manifest>` element.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/manifest-element#uidmaxsdk>
+    #[inline]
+    pub fn get_shared_user_max_sdk_version(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "sharedUserMaxSdkVersion", self.arsc.as_ref())
+    }
+
+    /// Retrieves the application version code.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/manifest-element#vcode>
+    ///
+    /// ```ignore
+    /// apk.get_version_code() // "2025101912"
+    /// ```
+    #[inline]
+    pub fn get_version_code(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "versionCode", self.arsc.as_ref())
+    }
+
+    /// Retrieves the human-readable application version name.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/manifest-element#vname>
+    ///
+    /// ```ignore
+    /// apk.get_version_name() // "1.2.3"
+    /// ```
+    #[inline]
+    pub fn get_version_name(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "versionName", self.arsc.as_ref())
+    }
+
+    /// Retrieves the preferred installation location.
+    ///
+    /// Possible values:
+    /// - `"auto"`
+    /// - `"internalOnly"`
+    /// - `"preferExternal"`
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/manifest-element#install>
+    #[inline]
+    pub fn get_install_location(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "installLocation", self.arsc.as_ref())
+    }
+
+    /// Retrieves the `platformBuildVersionCode` from the `<manifest>` element.
+    #[inline]
+    pub fn get_build_version_code(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "platformBuildVersionCode", self.arsc.as_ref())
+    }
+
+    /// Retrieves the `platformBuildVersionName` from the `<manifest>` element.
+    #[inline]
+    pub fn get_build_version_name(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "platformBuildVersionName", self.arsc.as_ref())
+    }
+
+    /// Retrieves the `compileSdkVersion` from the `<manifest>` element.
+    #[inline]
+    pub fn get_compile_sdk_version(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "compileSdkVersion", self.arsc.as_ref())
+    }
+
+    /// Retrieves the `compileSdkVersionCodename` from the `<manifest>` element.
+    #[inline]
+    pub fn get_compile_sdk_version_codename(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("manifest", "compileSdkVersionCodename", self.arsc.as_ref())
+    }
+
+    /// Extracts the `android:allowTaskReparenting` attribute from `<application>`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/application-element#reparent>
+    #[inline]
+    pub fn get_application_task_reparenting(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("application", "allowTaskReparenting", self.arsc.as_ref())
+    }
+
+    /// Extracts the `android:allowBackup` attribute from `<application>`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/application-element#allowbackup>
+    #[inline]
+    pub fn get_application_allow_backup(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("application", "allowBackup", self.arsc.as_ref())
+    }
+
+    /// Extracts the `android:appCategory` attribute from `<application>`.
+    ///
+    /// Possible values include:
+    /// - `"accessibility"`
+    /// - `"audio"`
+    /// - `"game"`
+    /// - `"image"`,
+    /// - `"maps"`
+    /// - `"news"`
+    /// - `"productivity"`
+    /// - `"social"`
+    /// - `"video"`
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/application-element#appCategory>
+    #[inline]
+    pub fn get_application_category(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("application", "appCategory", self.arsc.as_ref())
+    }
+
+    /// Extracts the `android:backupAgent` attribute from `<application>`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/application-element#agent>
+    #[inline]
+    pub fn get_application_backup_agent(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("application", "backupAgent", self.arsc.as_ref())
+    }
+
+    /// Extracts the `android:debuggable` attribute from `<application>`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/application-element#debug>
+    #[inline]
+    pub fn get_application_debuggable(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("application", "debuggable", self.arsc.as_ref())
+    }
+
+    /// Extracts and resolves the `android:description` attribute from `<application>`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/application-element#desc>
+    #[inline]
+    pub fn get_application_description(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("application", "description", self.arsc.as_ref())
+    }
+
+    /// Extracts and resolves the `android:icon` attribute from `<application>`
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/application-element#icon>
+    #[inline]
+    pub fn get_application_icon(&self) -> Option<String> {
+        // TODO: need somehow resolve maximum resolution for icon or give option to search density
+        self.axml
+            .get_attribute_value("application", "icon", self.arsc.as_ref())
+    }
+
+    /// Extracts and resolves the `android:label` attribute from `<application>`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/application-element#label>
+    #[inline]
+    pub fn get_application_label(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("application", "label", self.arsc.as_ref())
+    }
+
+    /// Extracts and resolves the `android:logo` attribute from `<application>`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/application-element#logo>
+    #[inline]
+    pub fn get_application_logo(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("application", "logo", self.arsc.as_ref())
+    }
+
+    /// The fully qualified name of an `Application` subclass implemented for the application.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/application-element#nm>
+    #[inline]
+    pub fn get_application_name(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("application", "name", self.arsc.as_ref())
+    }
+
+    #[inline]
+    pub fn get_attributions(&self) -> impl Iterator<Item = Attribution<'_>> {
+        self.axml
+            .root
+            .childrens()
+            .filter(|el| el.name() == "attribution")
+            .map(|el| Attribution {
+                tag: el.attr("tag"),
+                label: el.attr("label"),
+            })
+    }
+
+    /// Retrieves all declared permissions from `<uses-permission android:name="...">`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-permission-element>
+    #[inline]
+    pub fn get_permissions(&self) -> impl Iterator<Item = &str> {
+        self.axml
+            .get_root_attribute_values("uses-permission", "name")
+    }
+
+    /// Retrieves all declared permissions for API level 23 and above from `<uses-permission-sdk-23>` elements.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-permission-sdk-23-element>
+    #[inline]
+    pub fn get_permissions_sdk23(&self) -> impl Iterator<Item = &str> {
+        self.axml
+            .get_root_attribute_values("uses-permission-sdk-23", "name")
+    }
+
+    /// Extracts the minimum supported SDK version (`minSdkVersion`) from the `<uses-sdk>` element.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-sdk-element#min>
+    #[inline]
+    pub fn get_min_sdk_version(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("uses-sdk", "minSdkVersion", self.arsc.as_ref())
+    }
+
+    /// Extracts the target SDK version (`targetSdkVersion`) from the `<uses-sdk>` element.
+    ///
+    /// Determines the version based on the following algorithm:
+    /// 1. Check `targetSdkVersion`;
+    /// 2. If empty => check `minSdkVersion`;
+    /// 3. If empty => return 1;
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-sdk-element#target>
+    #[inline]
+    pub fn get_target_sdk_version(&self) -> u32 {
+        self.axml
+            .get_attribute_value("uses-sdk", "targetSdkVersion", self.arsc.as_ref())
+            .or_else(|| self.get_min_sdk_version())
+            .and_then(|sdk| sdk.parse::<u32>().ok())
+            .unwrap_or(1)
+    }
+
+    /// Retrieves the maximum supported SDK version (`maxSdkVersion`) if declared.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-sdk-element#max>
+    #[inline]
+    pub fn get_max_sdk_version(&self) -> Option<String> {
+        self.axml
+            .get_attribute_value("uses-sdk", "maxSdkVersion", self.arsc.as_ref())
+    }
+
+    /// Retrieves all libraries declared by `<uses-library android:name="...">`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-library-element>
+    #[inline]
+    pub fn get_libraries(&self) -> impl Iterator<Item = &str> {
+        self.axml.get_all_attribute_values("uses-library", "name")
+    }
+
+    /// Retrieves all native libraries declared by `<uses-native-library android:name="...">`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-native-library-element>
+    #[inline]
+    pub fn get_native_libraries(&self) -> impl Iterator<Item = &str> {
+        self.axml
+            .get_all_attribute_values("uses-native-library", "name")
+    }
+
+    /// Retrieves all hardware or software features declared by `<uses-feature android:name="...">`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-feature-element>
+    #[inline]
+    pub fn get_features(&self) -> impl Iterator<Item = &str> {
+        self.axml.get_root_attribute_values("uses-feature", "name")
+    }
+
+    /// Checks whether the app is designed to display its user interface on multiple screens inside the vehicle.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-feature-element#device-ui-hw-features>
+    #[inline]
+    pub fn is_automotive(&self) -> bool {
+        self.get_features()
+            .any(|x| x == "android.hardware.type.automotive")
+    }
+
+    /// Checks whether the app is designed to show its UI on a television.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-feature-element#device-ui-hw-features>
+    #[inline]
+    pub fn is_leanback(&self) -> bool {
+        self.get_features()
+            .any(|x| x == "android.hardware.type.television" || x == "android.software.leanback")
+    }
+
+    /// Checks whether the app is designed to show its UI on a watch.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-feature-element#device-ui-hw-features>
+    #[inline]
+    pub fn is_wearable(&self) -> bool {
+        self.get_features()
+            .any(|x| x == "android.hardware.type.watch")
+    }
+
+    /// Checks whether the app is designed to show its UI on Chromebooks.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/uses-feature-element#device-ui-hw-features>
+    #[inline]
+    pub fn is_chromebook(&self) -> bool {
+        self.get_features().any(|x| x == "android.hardware.type.pc")
+    }
+
+    /// Retrieves all user-defined permissions.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/permission-element>
+    #[inline]
+    pub fn get_declared_permissions(&self) -> impl Iterator<Item = Permission<'_>> {
+        // iterates only on childrens, since this tag lives only as a child of the <manifest> tag
+        self.axml
+            .root
+            .childrens()
+            .filter(|&el| el.name() == "permission")
+            .map(|el| Permission {
+                description: el.attr("description"),
+                icon: el.attr("icon"),
+                label: el.attr("label"),
+                name: el.attr("name"),
+                permission_group: el.attr("permissionGroup"),
+                protection_level: el.attr("protectionLevel"),
+            })
+    }
+
+    /// Retrieves the first main (launchable) activity defined in the manifest.
+    ///
+    /// A main activity is typically one that has an intent filter with actions `MAIN` and categories `LAUNCHER` or `INFO`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/activity-element>
+    ///
+    /// Resolve logic: <https://xrefandroid.com/android-16.0.0_r2/xref/frameworks/base/core/java/android/app/ApplicationPackageManager.java#310>
+    #[inline]
+    pub fn get_main_activity(&self) -> Option<&str> {
+        self.axml.get_main_activities().next()
+    }
+
+    /// Retrieves all main (launchable) activities defined in the manifest.
+    ///
+    /// A main activity is typically one that has an intent filter with actions `MAIN` and categories `LAUNCHER` or `INFO`.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/activity-element>
+    ///
+    /// Resolve logic: <https://xrefandroid.com/android-16.0.0_r2/xref/frameworks/base/core/java/android/app/ApplicationPackageManager.java#310>
+    #[inline]
+    pub fn get_main_activities(&self) -> impl Iterator<Item = &str> {
+        self.axml.get_main_activities()
+    }
+
+    #[inline]
+    fn get_intent_filters<'a>(
+        &'a self,
+        element: &'a Element,
+    ) -> impl Iterator<Item = IntentFilter<'a>> {
+        element
+            .childrens()
+            .filter(|intent| intent.name() == "intent-filter")
+            .map(|intent| {
+                let mut actions = Vec::new();
+                let mut categories = Vec::new();
+
+                // only one iteration
+                for child in intent.childrens() {
+                    match child.name() {
+                        "action" => {
+                            if let Some(name) = child.attr("name") {
+                                actions.push(name);
+                            }
+                        }
+                        "category" => {
+                            if let Some(name) = child.attr("name") {
+                                categories.push(name);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                IntentFilter {
+                    actions,
+                    categories,
+                }
+            })
+    }
+
+    /// Retrieves all `<activity>` components declared in the manifest.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/activity-element>
+    #[inline]
+    pub fn get_activities(&self) -> impl Iterator<Item = Activity<'_>> {
+        self.axml
+            .root
+            .descendants()
+            .filter(|&el| el.name() == "activity")
+            .map(|el| Activity {
+                enabled: el.attr("enabled"),
+                exported: el.attr("exported"),
+                icon: el.attr("icon"),
+                label: el.attr("label"),
+                name: el.attr("name"),
+                parent_activity_name: el.attr("parent_activity_name"),
+                permission: el.attr("permission"),
+                process: el.attr("process"),
+                intent_filters: self.get_intent_filters(el).collect(),
+            })
+    }
+
+    /// Retrieves all `<activity-alias>` components declared in the manifest.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/activity-element>
+    #[inline]
+    pub fn get_activity_aliases(&self) -> impl Iterator<Item = ActivityAlias<'_>> {
+        self.axml
+            .root
+            .descendants()
+            .filter(|&el| el.name() == "activity-alias")
+            .map(|el| ActivityAlias {
+                enabled: el.attr("enabled"),
+                exported: el.attr("exported"),
+                icon: el.attr("icon"),
+                label: el.attr("label"),
+                name: el.attr("name"),
+                permission: el.attr("permission"),
+                target_activity: el.attr("targetActivity"),
+                intent_filters: self.get_intent_filters(el).collect(),
+            })
+    }
+
+    /// Retrieves all `<service>` components declared in the manifest.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/service-element>
+    #[inline]
+    pub fn get_services(&self) -> impl Iterator<Item = Service<'_>> {
+        self.axml
+            .root
+            .descendants()
+            .filter(|&el| el.name() == "service")
+            .map(|el| Service {
+                description: el.attr("description"),
+                direct_boot_aware: el.attr("direct_boot_aware"),
+                enabled: el.attr("enabled"),
+                exported: el.attr("exported"),
+                foreground_service_type: el.attr("foreground_service_type"),
+                icon: el.attr("icon"),
+                isolated_process: el.attr("isolated_process"),
+                label: el.attr("label"),
+                name: el.attr("name"),
+                permission: el.attr("permission"),
+                process: el.attr("process"),
+                stop_with_task: el.attr("stop_with_task"),
+            })
+    }
+
+    /// Retrieves all `<receiver>` components declared in the manifest.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/receiver-element>
+    #[inline]
+    pub fn get_receivers(&self) -> impl Iterator<Item = Receiver<'_>> {
+        self.axml
+            .root
+            .descendants()
+            .filter(|&el| el.name() == "receiver")
+            .map(|el| Receiver {
+                direct_boot_aware: el.attr("direct_boot_aware"),
+                enabled: el.attr("enabled"),
+                exported: el.attr("exported"),
+                icon: el.attr("icon"),
+                label: el.attr("label"),
+                name: el.attr("name"),
+                permission: el.attr("permission"),
+                process: el.attr("process"),
+            })
+    }
+
+    /// Retrieves all `<provider>` components declared in the manifest.
+    ///
+    /// See: <https://developer.android.com/guide/topics/manifest/provider-element>
+    #[inline]
+    pub fn get_providers(&self) -> impl Iterator<Item = Provider<'_>> {
+        self.axml
+            .root
+            .descendants()
+            .filter(|&el| el.name() == "provider")
+            .map(|el| Provider {
+                authorities: el.attr("authorities"),
+                enabled: el.attr("enabled"),
+                direct_boot_aware: el.attr("direct_boot_aware"),
+                exported: el.attr("exported"),
+                grant_uri_permissions: el.attr("grant_uri_permissions"),
+                icon: el.attr("icon"),
+                init_order: el.attr("init_order"),
+                label: el.attr("label"),
+                multiprocess: el.attr("multiprocess"),
+                name: el.attr("name"),
+                permission: el.attr("permission"),
+                process: el.attr("process"),
+                read_permission: el.attr("read_permission"),
+                syncable: el.attr("syncable"),
+                write_permission: el.attr("write_permission"),
+            })
+    }
+
+    fn collect_signatures(zip: &ZipEntry) -> Result<Vec<Signature>, APKError> {
+        let mut signatures = Vec::new();
+        if let Ok(v1_sig) = zip.get_signature_v1() {
+            signatures.push(v1_sig);
+        }
+        signatures.extend(
+            zip.get_signatures_other()
+                .map_err(APKError::CertificateError)?,
+        );
+        Ok(signatures)
+    }
+
+    /// Returns the base APK inside a `xapk`/`apkm` container as a parsed ZIP
+    /// archive, cached from [`Apk::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [APKError::InvalidInput] for a plain apk, or [APKError::ZipError]
+    /// when the container's base apk cannot be read or parsed.
+    pub fn get_inner_zip(&self) -> Result<&ZipEntry, APKError> {
+        let Some(name) = self.base_apk_name.as_deref() else {
+            return Err(APKError::InvalidInput("not a container"));
+        };
+
+        self.inner_zip
+            .get_or_init(|| {
+                // deterministic on fixed bytes, so caching a failure is safe
+                self.zip
+                    .read(name)
+                    .ok()
+                    .and_then(|(data, _)| ZipEntry::from_reader(Cursor::new(data)).ok())
+            })
+            .as_ref()
+            .ok_or(APKError::ZipError(ZipError::ParseError))
+    }
+
+    /// Returns the app signatures (v1, v2, v3, v3.1, etc).
+    ///
+    /// For a plain APK this is the signature of the file itself.
+    ///
+    /// For a `xapk`/`apkm` container this is the signature of the inner base APK,
+    /// which is the actual app identity.
+    /// See [`Apk::get_container_signatures`] for the signature of the container itself.
+    pub fn get_signatures(&self) -> Result<Vec<Signature>, APKError> {
+        if self.base_apk_name.is_some() {
+            let inner = self.get_inner_zip()?;
+            return Self::collect_signatures(inner);
+        }
+        Self::collect_signatures(&self.zip)
+    }
+
+    /// Returns the container signature of a `xapk`/`apkm` file, if it is signed.
+    ///
+    /// This is the signature of the outer archive that carries the split APKs.
+    /// It belongs to the distributor, not to the app.
+    /// Most `xapk`/`apkm` containers are unsigned, so an empty result is expected and normal.
+    pub fn get_container_signatures(&self) -> Result<Vec<Signature>, APKError> {
+        if self.base_apk_name.is_none() {
+            return Ok(Vec::new());
+        }
+        Self::collect_signatures(&self.zip)
+    }
+
+    /// Information about the native code (.so libraries) of the APK file.
+    pub fn get_supported_abis(&self) -> Vec<String> {
+        let mut native_codes_set: HashSet<String> = HashSet::new();
+
+        let mut collect = |zip: &ZipEntry| {
+            for filename in zip.namelist() {
+                // native libs inside the app itself (regular apk)
+                if let Some((abi, lib)) = filename
+                    .strip_prefix("lib/")
+                    .and_then(|rest| rest.split_once('/'))
+                    && lib.ends_with(".so")
+                    && !abi.is_empty()
+                {
+                    native_codes_set.insert(abi.to_owned());
+                    continue;
+                }
+
+                // ABI split apk inside a xapk/apkm container, e.g. `config.armeabi_v7a.apk` or `split_config.arm64_v8a.apk`.
+                if let Some(abi) = Self::split_abi_from_name(filename) {
+                    native_codes_set.insert(abi);
+                }
+            }
+        };
+
+        collect(&self.zip);
+
+        // split (xapk/apkm): the inner apk is cached, no re-reading
+        if let Ok(inner) = self.get_inner_zip() {
+            collect(inner);
+        }
+
+        let mut native_codes: Vec<String> = native_codes_set.into_iter().collect();
+        native_codes.sort();
+        native_codes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use apk_info_zip::ZipEntry;
+
+    use super::Apk;
+
+    #[test]
+    fn valid_dex_names_are_accepted() {
+        for valid in [
+            "classes.dex",
+            "classes2.dex",
+            "classes0.dex",
+            "classes09.dex",
+            "classes123.dex",
+            "classes999999.dex",
+            "classes18446744073709551615.dex",
+        ] {
+            assert!(Apk::is_dex_name(valid), "{valid:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn invalid_names_are_rejected() {
+        for invalid in [
+            "AndroidManifest.xml",
+            "resources.arsc",
+            "lib/classes2.dex", // not the right shape: prefix isn't `classes`
+            "xclasses.dex",
+            "Classes2.dex", // case-sensitive
+            "classesdex",   // no `.dex` suffix
+            "classes.dxe",
+            "classes2.dexx",
+            "classes",
+            ".dex",
+            "",
+        ] {
+            assert!(!Apk::is_dex_name(invalid), "{invalid:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn non_numeric_middle_is_rejected() {
+        for invalid in [
+            "classes_.dex",
+            "classes-.dex",
+            "classesA.dex",
+            "classesab.dex",
+            "classes2.2.dex",
+            "classes.dex.dex", // middle would be `.dex`
+            "classes12a34.dex",
+        ] {
+            assert!(!Apk::is_dex_name(invalid), "{invalid:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn non_ascii_and_whitespace_middle_is_rejected() {
+        for invalid in [
+            "classesé.dex",
+            "classes1 .dex",
+            "classes 2.dex",
+            "classes.dex ",
+        ] {
+            assert!(!Apk::is_dex_name(invalid), "{invalid:?} should be rejected");
+        }
+    }
+
+    /// Builds a minimal, well-formed zip archive with a single stored
+    /// (uncompressed) entry. Enough for [`Apk::get_arsc`] to locate and read
+    /// `resources.arsc` without pulling in the zip writer's test helpers.
+    fn single_stored_zip(name: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        // local file header
+        out.extend_from_slice(&0x04034b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc (unchecked for stored)
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // csize
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // usize
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        out.extend_from_slice(name);
+        out.extend_from_slice(data);
+
+        // central directory file header
+        let cd_offset = out.len() as u32;
+        out.extend_from_slice(&0x02014b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+        out.extend_from_slice(&0u32.to_le_bytes()); // crc
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // csize
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // usize
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        out.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        out.extend_from_slice(name);
+        let cd_size = out.len() as u32 - cd_offset;
+
+        // end of central directory
+        out.extend_from_slice(&0x06054b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        out.extend_from_slice(&0u16.to_le_bytes()); // cd start disk
+        out.extend_from_slice(&1u16.to_le_bytes()); // entries this disk
+        out.extend_from_slice(&1u16.to_le_bytes()); // total entries
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+
+        out
+    }
+
+    /// A present-but-corrupt `resources.arsc` (a static-analysis evasion trick)
+    /// must not be fatal: the whole APK is still parsed, `get_arsc` just yields
+    /// `None`, exactly as it does for a missing table.
+    #[test]
+    fn corrupt_arsc_is_non_fatal() {
+        let zip = ZipEntry::new(single_stored_zip(
+            b"resources.arsc",
+            b"NOT A VALID ARSC TABLE",
+        ))
+        .expect("test zip should parse");
+
+        let arsc = Apk::get_arsc(&zip).expect("corrupt resources.arsc must not be fatal");
+        assert!(
+            arsc.is_none(),
+            "corrupt resources.arsc should resolve to None"
+        );
+    }
+
+    /// Control: an archive without `resources.arsc` also yields `None`, so the
+    /// corrupt case is indistinguishable from the missing case downstream.
+    #[test]
+    fn missing_arsc_is_none() {
+        let zip = ZipEntry::new(single_stored_zip(b"AndroidManifest.xml", b"<manifest/>"))
+            .expect("test zip should parse");
+
+        let arsc = Apk::get_arsc(&zip).expect("missing resources.arsc must not be fatal");
+        assert!(
+            arsc.is_none(),
+            "missing resources.arsc should resolve to None"
+        );
+    }
+}

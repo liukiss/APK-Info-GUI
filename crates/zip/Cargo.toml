@@ -1,0 +1,29 @@
+[package]
+name = "apk-info-zip"
+description = "A library for correctly unpacking APK files that use the BadPack technique"
+authors.workspace = true
+categories = ["parser-implementations"]
+edition.workspace = true
+keywords = ["zip", "badpack", "android", "apk", "malware"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ahash.workspace = true
+cms.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
+log.workspace = true
+md-5.workspace = true
+memchr.workspace = true
+serde.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+winnow.workspace = true
+x509-cert.workspace = true
+
+[lib]
+doctest = false

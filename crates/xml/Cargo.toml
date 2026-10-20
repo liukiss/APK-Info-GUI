@@ -1,0 +1,11 @@
+[package]
+name = "apk-info-xml"
+description = "A small custom library for easy working with xml dom"
+authors.workspace = true
+categories = ["parser-implementations", "data-structures"]
+edition.workspace = true
+keywords = ["xml", "dom", "android"]
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
